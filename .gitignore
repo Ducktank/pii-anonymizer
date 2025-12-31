@@ -40,6 +40,12 @@ wheels/
 *.db-wal
 *.db-shm
 
+# User data files (may contain PII)
+*.pdf
+*_AXSTMT.txt
+health.txt
+shop.txt
+
 # Test cache
 .pytest_cache/
 

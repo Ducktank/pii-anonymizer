@@ -16,6 +16,77 @@ import uuid
 import spacy
 
 
+class FullNameRecognizer(EntityRecognizer):
+    """Recognizer for full names in FIRSTNAME [MIDDLE] LASTNAME format.
+
+    Catches names that spaCy NER misses, especially in financial documents
+    where names appear in ALL CAPS format like 'RYAN S DEAN'.
+    """
+
+    def __init__(self):
+        self._nlp = None
+        super().__init__(
+            supported_entities=["PERSON"],
+            supported_language="en",
+            name="FullNameRecognizer",
+        )
+
+    def load(self):
+        if not self._nlp:
+            self._nlp = spacy.load("en_core_web_lg")
+
+    def analyze(self, text: str, entities: List[str], nlp_artifacts: NlpArtifacts = None) -> List[RecognizerResult]:
+        import re
+        self.load()
+        results = []
+
+        # Skip common non-name patterns (financial/document terms)
+        skip_words = {'NEW', 'OLD', 'THE', 'FOR', 'AND', 'NOT', 'ALL', 'DUE', 'APR', 'MAY',
+                      'TOTAL', 'BALANCE', 'PAYMENT', 'CREDIT', 'INTEREST', 'CHARGE',
+                      'TRANSACTIONS', 'PAYMENTS', 'CREDITS', 'ACCOUNT', 'NUMBER',
+                      'AMOUNT', 'DATE', 'STATEMENT', 'BILLING', 'SUMMARY'}
+
+        # Pattern 1: FIRSTNAME [MIDDLE_INITIAL] LASTNAME (all caps, same line only)
+        # Examples: RYAN S DEAN, JOHN DOE, MARY ANN SMITH
+        # Use [^\S\n]+ instead of \s+ to avoid matching across newlines
+        caps_name_pattern = r'\b([A-Z][A-Z]+)[^\S\n]+([A-Z]\.?[^\S\n]+)?([A-Z][A-Z]+)\b'
+
+        for match in re.finditer(caps_name_pattern, text):
+            full_match = match.group(0)
+            if len(full_match) < 5:
+                continue
+            first_word = match.group(1)
+            last_word = match.group(3)
+            if first_word in skip_words or last_word in skip_words:
+                continue
+            results.append(RecognizerResult(
+                entity_type="PERSON",
+                start=match.start(),
+                end=match.end(),
+                score=0.95,
+            ))
+
+        # Pattern 2: Name after masked text (XXXX pattern common in financial docs)
+        # Matches: XXXXXRYAN S DEAN, captures just the name portion
+        masked_name_pattern = r'X{3,}([A-Z][A-Z]+[^\S\n]+(?:[A-Z]\.?[^\S\n]+)?[A-Z][A-Z]+)\b'
+
+        for match in re.finditer(masked_name_pattern, text):
+            name_part = match.group(1)
+            words = name_part.split()
+            if any(w in skip_words for w in words):
+                continue
+            # The capture group (1) is the name part after X's
+            name_start = match.start() + len(match.group(0)) - len(name_part)
+            results.append(RecognizerResult(
+                entity_type="PERSON",
+                start=name_start,
+                end=match.end(),
+                score=0.95,
+            ))
+
+        return results
+
+
 class OrganizationRecognizer(EntityRecognizer):
     """Recognizer for organizations using spaCy NER (HIPAA: healthcare facilities)."""
 
@@ -160,6 +231,7 @@ class PIIAnonymizer:
         self.analyzer.registry.add_recognizer(dob_recognizer)
         self.analyzer.registry.add_recognizer(ssn_recognizer)
         self.analyzer.registry.add_recognizer(OrganizationRecognizer())
+        self.analyzer.registry.add_recognizer(FullNameRecognizer())
     
     def _get_placeholder(
         self, 
@@ -199,7 +271,29 @@ class PIIAnonymizer:
         self.reverse_mapping[original_value] = placeholder
         
         return placeholder
-    
+
+    def _resolve_overlaps(self, results: List) -> List:
+        """Remove overlapping entities, preferring longer spans and higher scores."""
+        if not results:
+            return results
+
+        # Sort by start position, then by length (longer first), then by score (higher first)
+        sorted_results = sorted(results, key=lambda r: (r.start, -(r.end - r.start), -r.score))
+
+        kept = []
+        for result in sorted_results:
+            # Check if this result overlaps with any kept result
+            overlaps = False
+            for kept_result in kept:
+                # Check for overlap: ranges overlap if one starts before the other ends
+                if not (result.end <= kept_result.start or result.start >= kept_result.end):
+                    overlaps = True
+                    break
+            if not overlaps:
+                kept.append(result)
+
+        return kept
+
     def analyze(self, text: str, entities: Optional[List[str]] = None) -> List[dict]:
         """Analyze text and return detected PII entities."""
         if entities is None:
@@ -255,7 +349,10 @@ class PIIAnonymizer:
         
         # Filter by confidence
         results = [r for r in results if r.score >= self.confidence_threshold]
-        
+
+        # Remove overlapping entities, preferring longer spans and higher scores
+        results = self._resolve_overlaps(results)
+
         # Sort by position (end to start) to replace without offset issues
         results.sort(key=lambda x: x.start, reverse=True)
         

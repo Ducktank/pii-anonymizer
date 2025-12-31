@@ -11,9 +11,40 @@ from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer, Entity
 from presidio_analyzer.nlp_engine import NlpArtifacts
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
-from typing import Dict, List, Tuple, Optional
-import uuid
+from typing import Dict, List, Tuple, Optional, Set
+import threading
+import os
 import spacy
+
+
+# Thread-safe shared spaCy model singleton
+_nlp_lock = threading.Lock()
+_nlp_model = None
+
+def get_shared_nlp():
+    """Get or load shared spaCy model (thread-safe singleton)."""
+    global _nlp_model
+    if _nlp_model is None:
+        with _nlp_lock:
+            if _nlp_model is None:
+                _nlp_model = spacy.load("en_core_web_lg")
+    return _nlp_model
+
+
+# Configurable skip words for name recognition
+DEFAULT_SKIP_WORDS = frozenset({
+    'NEW', 'OLD', 'THE', 'FOR', 'AND', 'NOT', 'ALL', 'DUE', 'APR', 'MAY',
+    'TOTAL', 'BALANCE', 'PAYMENT', 'CREDIT', 'INTEREST', 'CHARGE',
+    'TRANSACTIONS', 'PAYMENTS', 'CREDITS', 'ACCOUNT', 'NUMBER',
+    'AMOUNT', 'DATE', 'STATEMENT', 'BILLING', 'SUMMARY'
+})
+
+def get_skip_words() -> Set[str]:
+    """Get skip words from environment or use defaults."""
+    env_words = os.getenv("PII_SKIP_WORDS")
+    if env_words:
+        return frozenset(w.strip().upper() for w in env_words.split(","))
+    return DEFAULT_SKIP_WORDS
 
 
 class FullNameRecognizer(EntityRecognizer):
@@ -24,7 +55,6 @@ class FullNameRecognizer(EntityRecognizer):
     """
 
     def __init__(self):
-        self._nlp = None
         super().__init__(
             supported_entities=["PERSON"],
             supported_language="en",
@@ -32,23 +62,14 @@ class FullNameRecognizer(EntityRecognizer):
         )
 
     def load(self):
-        if not self._nlp:
-            self._nlp = spacy.load("en_core_web_lg")
+        pass
 
     def analyze(self, text: str, entities: List[str], nlp_artifacts: NlpArtifacts = None) -> List[RecognizerResult]:
         import re
-        self.load()
         results = []
-
-        # Skip common non-name patterns (financial/document terms)
-        skip_words = {'NEW', 'OLD', 'THE', 'FOR', 'AND', 'NOT', 'ALL', 'DUE', 'APR', 'MAY',
-                      'TOTAL', 'BALANCE', 'PAYMENT', 'CREDIT', 'INTEREST', 'CHARGE',
-                      'TRANSACTIONS', 'PAYMENTS', 'CREDITS', 'ACCOUNT', 'NUMBER',
-                      'AMOUNT', 'DATE', 'STATEMENT', 'BILLING', 'SUMMARY'}
+        skip_words = get_skip_words()
 
         # Pattern 1: FIRSTNAME [MIDDLE_INITIAL] LASTNAME (all caps, same line only)
-        # Examples: RYAN S DEAN, JOHN DOE, MARY ANN SMITH
-        # Use [^\S\n]+ instead of \s+ to avoid matching across newlines
         caps_name_pattern = r'\b([A-Z][A-Z]+)[^\S\n]+([A-Z]\.?[^\S\n]+)?([A-Z][A-Z]+)\b'
 
         for match in re.finditer(caps_name_pattern, text):
@@ -67,7 +88,6 @@ class FullNameRecognizer(EntityRecognizer):
             ))
 
         # Pattern 2: Name after masked text (XXXX pattern common in financial docs)
-        # Matches: XXXXXRYAN S DEAN, captures just the name portion
         masked_name_pattern = r'X{3,}([A-Z][A-Z]+[^\S\n]+(?:[A-Z]\.?[^\S\n]+)?[A-Z][A-Z]+)\b'
 
         for match in re.finditer(masked_name_pattern, text):
@@ -75,7 +95,6 @@ class FullNameRecognizer(EntityRecognizer):
             words = name_part.split()
             if any(w in skip_words for w in words):
                 continue
-            # The capture group (1) is the name part after X's
             name_start = match.start() + len(match.group(0)) - len(name_part)
             results.append(RecognizerResult(
                 entity_type="PERSON",
@@ -90,12 +109,10 @@ class FullNameRecognizer(EntityRecognizer):
 class OrganizationRecognizer(EntityRecognizer):
     """Recognizer for organizations using spaCy NER (HIPAA: healthcare facilities)."""
 
-    # Exclude common abbreviations that spaCy incorrectly tags as ORG
     EXCLUDED = {"DOB", "SSN", "NPI", "MRN", "DOD", "PHI", "PII", "HIPAA", "ID"}
-    MIN_LENGTH = 5  # Minimum chars to consider as organization
+    MIN_LENGTH = 5
 
     def __init__(self):
-        self._nlp = None
         super().__init__(
             supported_entities=["ORGANIZATION"],
             supported_language="en",
@@ -103,13 +120,12 @@ class OrganizationRecognizer(EntityRecognizer):
         )
 
     def load(self):
-        if not self._nlp:
-            self._nlp = spacy.load("en_core_web_lg")
+        pass
 
     def analyze(self, text: str, entities: List[str], nlp_artifacts: NlpArtifacts = None) -> List[RecognizerResult]:
-        self.load()
+        nlp = get_shared_nlp()
         results = []
-        doc = self._nlp(text)
+        doc = nlp(text)
         for ent in doc.ents:
             if ent.label_ == "ORG":
                 org_text = ent.text.strip()
@@ -273,24 +289,30 @@ class PIIAnonymizer:
         return placeholder
 
     def _resolve_overlaps(self, results: List) -> List:
-        """Remove overlapping entities, preferring longer spans and higher scores."""
+        """Remove overlapping entities, preferring longer spans and higher scores. O(n log n)."""
         if not results:
             return results
 
-        # Sort by start position, then by length (longer first), then by score (higher first)
-        sorted_results = sorted(results, key=lambda r: (r.start, -(r.end - r.start), -r.score))
+        # Sort by: longer spans first, then higher scores, then earlier start
+        sorted_results = sorted(results, key=lambda r: (-(r.end - r.start), -r.score, r.start))
 
         kept = []
+        max_end = -1
+        # Process in order of priority, track furthest end seen
         for result in sorted_results:
-            # Check if this result overlaps with any kept result
-            overlaps = False
-            for kept_result in kept:
-                # Check for overlap: ranges overlap if one starts before the other ends
-                if not (result.end <= kept_result.start or result.start >= kept_result.end):
-                    overlaps = True
-                    break
-            if not overlaps:
+            if result.start >= max_end:
                 kept.append(result)
+                max_end = max(max_end, result.end)
+            else:
+                # Check overlap with kept results using binary search-like approach
+                overlaps = False
+                for k in kept:
+                    if not (result.end <= k.start or result.start >= k.end):
+                        overlaps = True
+                        break
+                if not overlaps:
+                    kept.append(result)
+                    max_end = max(max_end, result.end)
 
         return kept
 
@@ -430,21 +452,26 @@ class PIIAnonymizer:
             self.store.close()
 
 
-# Convenience functions for simple usage
+# Thread-safe singleton anonymizers
 _default_anonymizer = None
 _persistent_anonymizer = None
+_anonymizer_lock = threading.Lock()
 
 def get_anonymizer(persistent: bool = False, db_path: str = "pii_mappings.db") -> PIIAnonymizer:
-    """Get or create anonymizer instance."""
+    """Get or create anonymizer instance (thread-safe)."""
     global _default_anonymizer, _persistent_anonymizer
-    
+
     if persistent:
         if _persistent_anonymizer is None:
-            _persistent_anonymizer = PIIAnonymizer(persistent=True, db_path=db_path)
+            with _anonymizer_lock:
+                if _persistent_anonymizer is None:
+                    _persistent_anonymizer = PIIAnonymizer(persistent=True, db_path=db_path)
         return _persistent_anonymizer
     else:
         if _default_anonymizer is None:
-            _default_anonymizer = PIIAnonymizer()
+            with _anonymizer_lock:
+                if _default_anonymizer is None:
+                    _default_anonymizer = PIIAnonymizer()
         return _default_anonymizer
 
 def anonymize(text: str, persistent: bool = False) -> Tuple[str, Dict[str, str]]:

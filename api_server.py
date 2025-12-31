@@ -11,12 +11,16 @@ Endpoints:
     GET  /health          - Health check
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
+from collections import defaultdict
 import os
 import tempfile
+import time
+import secrets
 from pathlib import Path
 
 from anonymizer import PIIAnonymizer
@@ -26,6 +30,11 @@ from db_store import PIIMappingStore
 # Configuration
 DB_PATH = os.getenv("PII_DB_PATH", "pii_mappings.db")
 CONFIDENCE_THRESHOLD = float(os.getenv("PII_CONFIDENCE", "0.7"))
+API_KEY = os.getenv("PII_API_KEY")
+CORS_ORIGINS = os.getenv("PII_CORS_ORIGINS", "http://localhost:8501").split(",")
+MAX_UPLOAD_SIZE = int(os.getenv("PII_MAX_UPLOAD_MB", "10")) * 1024 * 1024
+RATE_LIMIT_REQUESTS = int(os.getenv("PII_RATE_LIMIT", "100"))
+RATE_LIMIT_WINDOW = 60
 
 # Initialize
 app = FastAPI(
@@ -34,14 +43,35 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS for local development
+# CORS - restricted to configured origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
+
+# API Key Authentication
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def verify_api_key(api_key: str = Depends(api_key_header)):
+    if not API_KEY:
+        return None
+    if not api_key or not secrets.compare_digest(api_key, API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return api_key
+
+# Rate limiting
+_rate_limit_store: Dict[str, List[float]] = defaultdict(list)
+
+async def rate_limit(request: Request):
+    client_ip = request.client.host
+    now = time.time()
+    _rate_limit_store[client_ip] = [t for t in _rate_limit_store[client_ip] if now - t < RATE_LIMIT_WINDOW]
+    if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_REQUESTS:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    _rate_limit_store[client_ip].append(now)
 
 
 # Request/Response models
@@ -110,11 +140,11 @@ async def health_check():
     }
 
 
-@app.post("/anonymize", response_model=AnonymizeResponse)
+@app.post("/anonymize", response_model=AnonymizeResponse, dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def anonymize_text(request: AnonymizeRequest):
     """
     Anonymize text by replacing PII with deterministic tokens.
-    
+
     Same PII value always produces the same token (deterministic, ACID-compliant).
     """
     anonymizer = get_anonymizer(request.confidence)
@@ -135,14 +165,14 @@ async def anonymize_text(request: AnonymizeRequest):
         anonymizer.close()
 
 
-@app.post("/anonymize/file", response_model=AnonymizeResponse)
+@app.post("/anonymize/file", response_model=AnonymizeResponse, dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def anonymize_file(
     file: UploadFile = File(...),
     confidence: Optional[float] = Query(None, ge=0.0, le=1.0)
 ):
     """
     Anonymize an uploaded file (PDF, DOCX, TXT, etc.).
-    
+
     Supported formats: .txt, .pdf, .docx, .md, .csv, .json
     """
     # Check file type
@@ -152,17 +182,24 @@ async def anonymize_file(
             status_code=400,
             detail=f"Unsupported file type: {suffix}. Supported: {FileProcessorFactory.supported_types()}"
         )
-    
+
+    # Check file size
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Max size: {MAX_UPLOAD_SIZE // (1024*1024)}MB"
+        )
+
     # Save to temp file
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
     
     try:
         # Process file
-        text, file_type, original_bytes = process_file(tmp_path)
-        
+        text, file_type, _ = process_file(tmp_path)
+
         # Anonymize
         anonymizer = get_anonymizer(confidence)
         anonymized_text, mapping = anonymizer.anonymize(
@@ -170,7 +207,7 @@ async def anonymize_file(
             source_file=file.filename
         )
         anonymizer.close()
-        
+
         return AnonymizeResponse(
             anonymized_text=anonymized_text,
             mapping=mapping,
@@ -180,11 +217,11 @@ async def anonymize_file(
         os.unlink(tmp_path)
 
 
-@app.post("/deanonymize", response_model=DeanonymizeResponse)
+@app.post("/deanonymize", response_model=DeanonymizeResponse, dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def deanonymize_text(request: DeanonymizeRequest):
     """
     Restore original PII values by replacing tokens.
-    
+
     Uses the persistent mapping store - works across sessions.
     """
     anonymizer = get_anonymizer()
@@ -196,11 +233,11 @@ async def deanonymize_text(request: DeanonymizeRequest):
         anonymizer.close()
 
 
-@app.post("/analyze", response_model=AnalyzeResponse)
+@app.post("/analyze", response_model=AnalyzeResponse, dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def analyze_text(request: AnonymizeRequest):
     """
     Analyze text for PII without anonymizing.
-    
+
     Returns list of detected entities with positions and confidence scores.
     """
     anonymizer = get_anonymizer(request.confidence)
@@ -212,14 +249,14 @@ async def analyze_text(request: AnonymizeRequest):
         anonymizer.close()
 
 
-@app.get("/mappings", response_model=List[MappingInfo])
+@app.get("/mappings", response_model=List[MappingInfo], dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def list_mappings(
     limit: int = Query(100, ge=1, le=1000),
     entity_type: Optional[str] = Query(None)
 ):
     """
     List stored PII mappings.
-    
+
     Note: Original values are not returned for security.
     """
     store = PIIMappingStore(DB_PATH)

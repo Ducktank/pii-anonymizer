@@ -12,12 +12,85 @@ Key properties:
 import sqlite3
 import hashlib
 import threading
-from datetime import datetime
+import base64
+import warnings
+from datetime import datetime, timezone
 from typing import Optional, Dict, List, Tuple
 from contextlib import contextmanager
 from pathlib import Path
 import json
 import os
+
+try:
+    from cryptography.fernet import Fernet
+    ENCRYPTION_AVAILABLE = True
+except ImportError:
+    ENCRYPTION_AVAILABLE = False
+
+
+class PIIEncryption:
+    """Handles encryption/decryption of PII values using Fernet (AES-128-CBC with HMAC)."""
+
+    _instance = None
+    _fernet = None
+    _key_version = 1
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        if not ENCRYPTION_AVAILABLE:
+            warnings.warn(
+                "cryptography library not installed. PII will be stored in PLAINTEXT. "
+                "Install with: pip install cryptography",
+                RuntimeWarning
+            )
+            self._fernet = None
+            return
+
+        key = os.environ.get('PII_ENCRYPTION_KEY')
+        if key:
+            try:
+                self._fernet = Fernet(key.encode() if isinstance(key, str) else key)
+            except Exception as e:
+                raise ValueError(f"Invalid PII_ENCRYPTION_KEY format: {e}")
+        else:
+            warnings.warn(
+                "PII_ENCRYPTION_KEY not set. Generating ephemeral key. "
+                "PII will NOT be recoverable after restart! "
+                "Set PII_ENCRYPTION_KEY env var for production.",
+                RuntimeWarning
+            )
+            key = Fernet.generate_key()
+            self._fernet = Fernet(key)
+            print(f"Generated ephemeral key (save for persistence): {key.decode()}")
+
+    def encrypt(self, plaintext: str) -> str:
+        """Encrypt plaintext, return versioned ciphertext."""
+        if not self._fernet:
+            return plaintext  # No encryption available
+        encrypted = self._fernet.encrypt(plaintext.encode('utf-8'))
+        return f"v{self._key_version}:{base64.urlsafe_b64encode(encrypted).decode()}"
+
+    def decrypt(self, ciphertext: str) -> str:
+        """Decrypt ciphertext, return plaintext. Handles legacy unencrypted data."""
+        if not self._fernet:
+            return ciphertext
+        if not ciphertext.startswith('v') or ':' not in ciphertext:
+            return ciphertext  # Legacy plaintext data
+        version, data = ciphertext.split(':', 1)
+        encrypted = base64.urlsafe_b64decode(data.encode())
+        return self._fernet.decrypt(encrypted).decode('utf-8')
+
+    @staticmethod
+    def generate_key() -> str:
+        """Generate a new Fernet encryption key."""
+        if not ENCRYPTION_AVAILABLE:
+            raise RuntimeError("cryptography library not installed")
+        return Fernet.generate_key().decode()
 
 
 class PIIMappingStore:
@@ -177,19 +250,23 @@ class PIIMappingStore:
                 conn.execute(
                     "INSERT INTO audit_log (operation, details, timestamp) VALUES (?, ?, ?)",
                     ("ACCESS", json.dumps({"content_hash": content_hash}), 
-                     datetime.utcnow().isoformat())
+                     datetime.now(timezone.utc).isoformat())
                 )
                 return existing['token']
             
             # Create new mapping
             token = self._generate_token(entity_type, content_hash)
-            now = datetime.utcnow().isoformat()
-            
+            now = datetime.now(timezone.utc).isoformat()
+
+            # Encrypt PII before storing
+            encryption = PIIEncryption.get_instance()
+            encrypted_value = encryption.encrypt(original_value)
+
             cursor = conn.execute(
-                """INSERT INTO pii_mappings 
+                """INSERT INTO pii_mappings
                    (content_hash, entity_type, original_value, token, created_at, source_file)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (content_hash, entity_type, original_value, token, now, source_file)
+                (content_hash, entity_type, encrypted_value, token, now, source_file)
             )
             
             # Audit log
@@ -211,11 +288,12 @@ class PIIMappingStore:
             "SELECT entity_type, original_value, created_at FROM pii_mappings WHERE token = ?",
             (token,)
         ).fetchone()
-        
+
         if result:
+            encryption = PIIEncryption.get_instance()
             return {
                 "entity_type": result['entity_type'],
-                "original_value": result['original_value'],
+                "original_value": encryption.decrypt(result['original_value']),
                 "created_at": result['created_at']
             }
         return None
@@ -247,10 +325,12 @@ class PIIMappingStore:
         mappings = conn.execute(
             "SELECT token, original_value FROM pii_mappings"
         ).fetchall()
-        
+
+        encryption = PIIEncryption.get_instance()
         result = text
         for mapping in mappings:
-            result = result.replace(mapping['token'], mapping['original_value'])
+            original = encryption.decrypt(mapping['original_value'])
+            result = result.replace(mapping['token'], original)
         return result
     
     def record_document(
@@ -269,7 +349,7 @@ class PIIMappingStore:
                    (file_hash, file_name, file_type, original_size, mappings_applied, processed_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 (file_hash, file_name, file_type, len(file_content),
-                 json.dumps(mappings_applied), datetime.utcnow().isoformat())
+                 json.dumps(mappings_applied), datetime.now(timezone.utc).isoformat())
             )
             return cursor.lastrowid
     
@@ -300,7 +380,7 @@ class PIIMappingStore:
         mappings = self.get_all_mappings()
         with open(output_path, 'w') as f:
             json.dump({
-                "exported_at": datetime.utcnow().isoformat(),
+                "exported_at": datetime.now(timezone.utc).isoformat(),
                 "schema_version": self.SCHEMA_VERSION,
                 "mappings": mappings
             }, f, indent=2)
@@ -312,22 +392,24 @@ class PIIMappingStore:
         """
         issues = []
         conn = self._get_connection()
-        
+
         # Check SQLite integrity
         result = conn.execute("PRAGMA integrity_check").fetchone()
         if result[0] != 'ok':
             issues.append(f"SQLite integrity check failed: {result[0]}")
-        
+
         # Verify all content hashes match
         rows = conn.execute(
             "SELECT id, content_hash, entity_type, original_value FROM pii_mappings"
         ).fetchall()
-        
+
+        encryption = PIIEncryption.get_instance()
         for row in rows:
-            expected_hash = self._compute_content_hash(row['entity_type'], row['original_value'])
+            decrypted_value = encryption.decrypt(row['original_value'])
+            expected_hash = self._compute_content_hash(row['entity_type'], decrypted_value)
             if expected_hash != row['content_hash']:
                 issues.append(f"Hash mismatch for mapping ID {row['id']}")
-        
+
         return len(issues) == 0, issues
     
     def close(self):

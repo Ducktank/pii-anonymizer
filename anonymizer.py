@@ -10,7 +10,6 @@ Supports two modes:
 from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer, EntityRecognizer, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpArtifacts
 from presidio_anonymizer import AnonymizerEngine
-from presidio_anonymizer.entities import OperatorConfig
 from typing import Dict, List, Tuple, Optional, Set
 import threading
 import os
@@ -69,15 +68,21 @@ class FullNameRecognizer(EntityRecognizer):
         results = []
         skip_words = get_skip_words()
 
+        # Limit text length to prevent ReDoS
+        max_len = 100000
+        if len(text) > max_len:
+            text = text[:max_len]
+
         # Pattern 1: FIRSTNAME [MIDDLE_INITIAL] LASTNAME (all caps, same line only)
-        caps_name_pattern = r'\b([A-Z][A-Z]+)[^\S\n]+([A-Z]\.?[^\S\n]+)?([A-Z][A-Z]+)\b'
+        # Made possessive to prevent backtracking
+        caps_name_pattern = r'\b([A-Z]{2,})(?: ([A-Z]\.?))?(?: ([A-Z]{2,}))\b'
 
         for match in re.finditer(caps_name_pattern, text):
             full_match = match.group(0)
             if len(full_match) < 5:
                 continue
             first_word = match.group(1)
-            last_word = match.group(3)
+            last_word = match.group(3) or match.group(1)
             if first_word in skip_words or last_word in skip_words:
                 continue
             results.append(RecognizerResult(
@@ -88,7 +93,7 @@ class FullNameRecognizer(EntityRecognizer):
             ))
 
         # Pattern 2: Name after masked text (XXXX pattern common in financial docs)
-        masked_name_pattern = r'X{3,}([A-Z][A-Z]+[^\S\n]+(?:[A-Z]\.?[^\S\n]+)?[A-Z][A-Z]+)\b'
+        masked_name_pattern = r'X{3,20}([A-Z]{2,}(?: [A-Z]\.?)?(?: [A-Z]{2,}))\b'
 
         for match in re.finditer(masked_name_pattern, text):
             name_part = match.group(1)

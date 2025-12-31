@@ -32,23 +32,25 @@ class PIIEncryption:
     """Handles encryption/decryption of PII values using Fernet (AES-128-CBC with HMAC)."""
 
     _instance = None
-    _fernet = None
+    _lock = threading.Lock()
     _key_version = 1
 
     @classmethod
     def get_instance(cls):
         if cls._instance is None:
-            cls._instance = cls()
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
         return cls._instance
 
     def __init__(self):
+        self._fernet = None
         if not ENCRYPTION_AVAILABLE:
             warnings.warn(
                 "cryptography library not installed. PII will be stored in PLAINTEXT. "
                 "Install with: pip install cryptography",
                 RuntimeWarning
             )
-            self._fernet = None
             return
 
         key = os.environ.get('PII_ENCRYPTION_KEY')
@@ -64,26 +66,23 @@ class PIIEncryption:
                 "Set PII_ENCRYPTION_KEY env var for production.",
                 RuntimeWarning
             )
-            key = Fernet.generate_key()
-            self._fernet = Fernet(key)
-            print(f"Generated ephemeral key (save for persistence): {key.decode()}")
+            self._fernet = Fernet(Fernet.generate_key())
 
     def encrypt(self, plaintext: str) -> str:
         """Encrypt plaintext, return versioned ciphertext."""
         if not self._fernet:
-            return plaintext  # No encryption available
+            return plaintext
         encrypted = self._fernet.encrypt(plaintext.encode('utf-8'))
-        return f"v{self._key_version}:{base64.urlsafe_b64encode(encrypted).decode()}"
+        return f"v{self._key_version}:{encrypted.decode()}"
 
     def decrypt(self, ciphertext: str) -> str:
         """Decrypt ciphertext, return plaintext. Handles legacy unencrypted data."""
         if not self._fernet:
             return ciphertext
         if not ciphertext.startswith('v') or ':' not in ciphertext:
-            return ciphertext  # Legacy plaintext data
-        version, data = ciphertext.split(':', 1)
-        encrypted = base64.urlsafe_b64decode(data.encode())
-        return self._fernet.decrypt(encrypted).decode('utf-8')
+            return ciphertext
+        _, data = ciphertext.split(':', 1)
+        return self._fernet.decrypt(data.encode()).decode('utf-8')
 
     @staticmethod
     def generate_key() -> str:
@@ -419,14 +418,17 @@ class PIIMappingStore:
             self._local.connection = None
 
 
-# Singleton instance
+# Thread-safe singleton store
 _store: Optional[PIIMappingStore] = None
+_store_lock = threading.Lock()
 
 def get_store(db_path: str = "pii_mappings.db") -> PIIMappingStore:
-    """Get or create singleton store instance."""
+    """Get or create singleton store instance (thread-safe)."""
     global _store
     if _store is None:
-        _store = PIIMappingStore(db_path)
+        with _store_lock:
+            if _store is None:
+                _store = PIIMappingStore(db_path)
     return _store
 
 

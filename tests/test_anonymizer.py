@@ -3,7 +3,7 @@
 import pytest
 import tempfile
 import os
-from anonymizer import PIIAnonymizer
+from anonymizer import PIIAnonymizer, FullNameRecognizer
 
 
 class TestPIIAnonymizer:
@@ -107,3 +107,79 @@ class TestPIIAnonymizer:
         assert len(anonymizer.mapping) > 0
         anonymizer.reset()
         assert len(anonymizer.mapping) == 0
+
+
+class TestFullNameRecognizer:
+    """Test FullNameRecognizer class."""
+
+    @pytest.fixture
+    def recognizer(self):
+        return FullNameRecognizer()
+
+    def test_detect_all_caps_name(self, recognizer):
+        text = "Patient RYAN S DEAN was admitted"
+        results = recognizer.analyze(text, ["PERSON"])
+        assert len(results) >= 1
+        names = [text[r.start:r.end] for r in results]
+        assert any("RYAN" in n and "DEAN" in n for n in names)
+
+    def test_detect_two_word_caps_name(self, recognizer):
+        text = "Report for JOHN SMITH"
+        results = recognizer.analyze(text, ["PERSON"])
+        assert len(results) >= 1
+
+    def test_skip_financial_terms(self, recognizer):
+        text = "TOTAL BALANCE DUE"
+        results = recognizer.analyze(text, ["PERSON"])
+        assert len(results) == 0
+
+    def test_skip_common_words(self, recognizer):
+        text = "NEW PAYMENT RECEIVED"
+        results = recognizer.analyze(text, ["PERSON"])
+        assert len(results) == 0
+
+    def test_detect_masked_name(self, recognizer):
+        text = "Card ending XXXXJOHN SMITH"
+        results = recognizer.analyze(text, ["PERSON"])
+        assert len(results) >= 1
+
+
+class TestResolveOverlaps:
+    """Test _resolve_overlaps method."""
+
+    @pytest.fixture
+    def anonymizer(self):
+        return PIIAnonymizer()
+
+    def test_no_overlaps(self, anonymizer):
+        from presidio_analyzer import RecognizerResult
+        results = [
+            RecognizerResult("PERSON", 0, 10, 0.9),
+            RecognizerResult("EMAIL", 20, 40, 0.85),
+        ]
+        kept = anonymizer._resolve_overlaps(results)
+        assert len(kept) == 2
+
+    def test_overlapping_prefers_longer(self, anonymizer):
+        from presidio_analyzer import RecognizerResult
+        results = [
+            RecognizerResult("PERSON", 0, 5, 0.9),
+            RecognizerResult("PERSON", 0, 10, 0.85),
+        ]
+        kept = anonymizer._resolve_overlaps(results)
+        assert len(kept) == 1
+        assert kept[0].end == 10
+
+    def test_overlapping_same_length_prefers_higher_score(self, anonymizer):
+        from presidio_analyzer import RecognizerResult
+        results = [
+            RecognizerResult("PERSON", 0, 10, 0.7),
+            RecognizerResult("PERSON", 0, 10, 0.9),
+        ]
+        kept = anonymizer._resolve_overlaps(results)
+        assert len(kept) == 1
+        assert kept[0].score == 0.9
+
+    def test_empty_input(self, anonymizer):
+        kept = anonymizer._resolve_overlaps([])
+        assert kept == []

@@ -159,13 +159,12 @@ class JSONProcessor(FileProcessor):
 
 class FileProcessorFactory:
     """Factory for getting appropriate file processor."""
-    
+
     PROCESSORS = {
         '.txt': TextProcessor,
         '.text': TextProcessor,
         '.pdf': PDFProcessor,
         '.docx': DocxProcessor,
-        '.doc': DocxProcessor,  # Note: .doc requires different handling
         '.md': MarkdownProcessor,
         '.markdown': MarkdownProcessor,
         '.csv': CSVProcessor,
@@ -201,23 +200,35 @@ class FileProcessorFactory:
         return list(cls.PROCESSORS.keys())
 
 
-def process_file(file_path: Union[str, Path]) -> Tuple[str, str, bytes]:
+def process_file(file_path: Union[str, Path], allowed_dir: Optional[Path] = None) -> Tuple[str, str, bytes]:
     """
     Read and extract text from a file.
-    
+
+    Args:
+        file_path: Path to file
+        allowed_dir: If provided, file must be within this directory (path traversal protection)
+
     Returns: (text_content, file_type, original_bytes)
     """
-    path = Path(file_path)
-    
+    path = Path(file_path).resolve()
+
+    if allowed_dir:
+        allowed = Path(allowed_dir).resolve()
+        if not str(path).startswith(str(allowed)):
+            raise ValueError(f"Path traversal detected: {file_path}")
+
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
-    
+
+    if not path.is_file():
+        raise ValueError(f"Not a file: {path}")
+
     with open(path, 'rb') as f:
         content = f.read()
-    
+
     processor = FileProcessorFactory.get_processor(path)
     text = processor.extract_text(content)
-    
+
     return text, path.suffix.lower(), content
 
 

@@ -14,9 +14,11 @@ Endpoints:
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Dict
-from collections import defaultdict
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+import threading
 import os
 import tempfile
 import time
@@ -33,8 +35,10 @@ CONFIDENCE_THRESHOLD = float(os.getenv("PII_CONFIDENCE", "0.7"))
 API_KEY = os.getenv("PII_API_KEY")
 CORS_ORIGINS = os.getenv("PII_CORS_ORIGINS", "http://localhost:8501").split(",")
 MAX_UPLOAD_SIZE = int(os.getenv("PII_MAX_UPLOAD_MB", "10")) * 1024 * 1024
+MAX_TEXT_SIZE = int(os.getenv("PII_MAX_TEXT_KB", "1024")) * 1024
 RATE_LIMIT_REQUESTS = int(os.getenv("PII_RATE_LIMIT", "100"))
 RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX_IPS = 10000
 
 # Initialize
 app = FastAPI(
@@ -62,22 +66,39 @@ async def verify_api_key(api_key: str = Depends(api_key_header)):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return api_key
 
-# Rate limiting
-_rate_limit_store: Dict[str, List[float]] = defaultdict(list)
+# Rate limiting with LRU eviction
+class RateLimitStore:
+    def __init__(self, max_ips: int = 10000):
+        self._store: OrderedDict[str, List[float]] = OrderedDict()
+        self._lock = threading.Lock()
+        self._max_ips = max_ips
+
+    def check_and_record(self, ip: str, now: float, window: int, limit: int) -> bool:
+        with self._lock:
+            if ip in self._store:
+                self._store.move_to_end(ip)
+                self._store[ip] = [t for t in self._store[ip] if now - t < window]
+            else:
+                if len(self._store) >= self._max_ips:
+                    self._store.popitem(last=False)
+                self._store[ip] = []
+            if len(self._store[ip]) >= limit:
+                return False
+            self._store[ip].append(now)
+            return True
+
+_rate_limiter = RateLimitStore(RATE_LIMIT_MAX_IPS)
 
 async def rate_limit(request: Request):
-    client_ip = request.client.host
-    now = time.time()
-    _rate_limit_store[client_ip] = [t for t in _rate_limit_store[client_ip] if now - t < RATE_LIMIT_WINDOW]
-    if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_REQUESTS:
+    client_ip = request.client.host if request.client else "unknown"
+    if not _rate_limiter.check_and_record(client_ip, time.time(), RATE_LIMIT_WINDOW, RATE_LIMIT_REQUESTS):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
-    _rate_limit_store[client_ip].append(now)
 
 
 # Request/Response models
 class AnonymizeRequest(BaseModel):
-    text: str = Field(..., description="Text to anonymize")
-    source: Optional[str] = Field(None, description="Source identifier for audit")
+    text: str = Field(..., description="Text to anonymize", max_length=MAX_TEXT_SIZE)
+    source: Optional[str] = Field(None, description="Source identifier for audit", max_length=256)
     entities: Optional[List[str]] = Field(None, description="Entity types to detect")
     confidence: Optional[float] = Field(None, ge=0.0, le=1.0, description="Confidence threshold")
 
@@ -131,10 +152,9 @@ async def health_check():
     store = PIIMappingStore(DB_PATH)
     is_valid, issues = store.verify_integrity()
     store.close()
-    
+
     return {
         "status": "healthy" if is_valid else "degraded",
-        "database": DB_PATH,
         "integrity": is_valid,
         "issues": issues if not is_valid else None
     }
@@ -175,7 +195,6 @@ async def anonymize_file(
 
     Supported formats: .txt, .pdf, .docx, .md, .csv, .json
     """
-    # Check file type
     suffix = Path(file.filename).suffix.lower()
     if not FileProcessorFactory.is_supported(file.filename):
         raise HTTPException(
@@ -183,7 +202,6 @@ async def anonymize_file(
             detail=f"Unsupported file type: {suffix}. Supported: {FileProcessorFactory.supported_types()}"
         )
 
-    # Check file size
     content = await file.read()
     if len(content) > MAX_UPLOAD_SIZE:
         raise HTTPException(
@@ -191,16 +209,13 @@ async def anonymize_file(
             detail=f"File too large. Max size: {MAX_UPLOAD_SIZE // (1024*1024)}MB"
         )
 
-    # Save to temp file
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
-    
+    tmp_path = None
     try:
-        # Process file
-        text, file_type, _ = process_file(tmp_path)
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
 
-        # Anonymize
+        text, file_type, _ = process_file(tmp_path)
         anonymizer = get_anonymizer(confidence)
         anonymized_text, mapping = anonymizer.anonymize(
             text=text,
@@ -214,7 +229,8 @@ async def anonymize_file(
             entities_found=len(mapping)
         )
     finally:
-        os.unlink(tmp_path)
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 @app.post("/deanonymize", response_model=DeanonymizeResponse, dependencies=[Depends(verify_api_key), Depends(rate_limit)])
@@ -295,24 +311,24 @@ async def list_mappings(
         store.close()
 
 
-@app.get("/stats", response_model=StatsResponse)
+@app.get("/stats", response_model=StatsResponse, dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def get_stats():
     """Get statistics about the mapping store."""
     store = PIIMappingStore(DB_PATH)
-    
+
     try:
         stats = store.get_stats()
         return StatsResponse(
             total_mappings=stats['total_mappings'],
             by_entity_type=stats['by_entity_type'],
             total_documents_processed=stats['total_documents_processed'],
-            database_path=DB_PATH
+            database_path="[redacted]"
         )
     finally:
         store.close()
 
 
-@app.get("/entities")
+@app.get("/entities", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def list_supported_entities():
     """List all supported PII entity types."""
     anonymizer = get_anonymizer()
@@ -325,18 +341,18 @@ async def list_supported_entities():
         anonymizer.close()
 
 
-# Startup/shutdown events
-@app.on_event("startup")
-async def startup():
-    """Initialize database on startup."""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown."""
     store = PIIMappingStore(DB_PATH)
     is_valid, issues = store.verify_integrity()
     store.close()
-    
     if not is_valid:
         print(f"WARNING: Database integrity issues: {issues}")
-    else:
-        print(f"PII Anonymizer API started. Database: {DB_PATH}")
+    yield
+
+
+app.router.lifespan_context = lifespan
 
 
 if __name__ == "__main__":

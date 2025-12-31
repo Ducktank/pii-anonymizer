@@ -73,12 +73,12 @@ def cmd_anonymize(args):
         print("=" * 60)
         print(anonymized_text)
     
-    # Show summary
+    # Show summary (without revealing PII)
     print(f"\n--- Summary ---")
     print(f"PII items replaced: {len(mapping)}")
-    for token, original in mapping.items():
+    for token in mapping.keys():
         entity_type = token.split('_')[0].replace('[', '')
-        print(f"  {entity_type}: {original[:20]}{'...' if len(original) > 20 else ''} → {token}")
+        print(f"  {entity_type}: [REDACTED] → {token}")
     
     anonymizer.close()
     return 0
